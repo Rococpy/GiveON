@@ -1,0 +1,267 @@
+import { createHash } from 'node:crypto';
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder,ContainerBuilder,TextDisplayBuilder,MessageFlags } from 'discord.js';
+import { files } from './media.js';
+import { HOST_NOTICE_KINDS } from './engine.js';
+import { isDirect,deliverySummary,productInfo,productNameLabel } from './delivery.js';
+import { eventTimesText } from './time-limits.js';
+
+export const statuses = {
+  DRAFT: '초안', PENDING: '승인 대기', STARTING: '시작 게시 대기', RUNNING: '참여 중', DRAWN: '추첨 완료·수령 진행',
+  COMPLETED: '마감', CANCELLED: '취소', REJECTED: '신청 거절', ANNOUNCING: '당첨 알림 대기',
+  CLAIMABLE: '수령 대기', SUBMITTING: '인증 제출 중', UPLOADING: '제출 파일 처리 중', REVIEW: '인증 검수 대기', READY: '자동 전달 대기',
+  PREPARING: '전달 준비 중', SENDING: '전달 중', DELIVERED: '수령 완료', EXPIRED: '기한 초과·리롤',
+  DENIED: '당첨 종료', DELIVERY_FAILED: 'DM 실패·재시도 가능', DELIVERY_UNKNOWN: '전송 결과 확인 필요',
+};
+export const time = ms => `<t:${Math.floor(ms / 1000)}:R>`;
+const button = (id, label, style = ButtonStyle.Primary) => new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style);
+const row = (...buttons) => new ActionRowBuilder().addComponents(buttons);
+const profileButton = (userId,label) => new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link).setURL(`https://discord.com/users/${userId}`);
+const nonce = value => createHash('sha256').update(value).digest('hex').slice(0, 24);
+
+function markDefinite(error) {
+  // 네트워크 타임아웃·5xx는 Discord가 수신했을 수도 있으므로 확정 실패로 취급하지 않습니다.
+  if (typeof error.status === 'number' && error.status >= 400 && error.status < 500 && error.status !== 429) error.definite = true;
+  return error;
+}
+
+export class DiscordTransport {
+  constructor(client, store, vault) { Object.assign(this, { client, store, vault }); }
+  async roles(guildId,ids) {
+    if(!ids.length) return [];
+    const guild=await this.client.guilds.fetch(guildId),roles=await guild.roles.fetch();
+    return ids.map(id=>roles.get(id)).filter(role=>role&&role.id!==guildId).map(role=>({id:role.id,name:role.name}));
+  }
+  async member(guildId, userId) {
+    try {
+      const guild = await this.client.guilds.fetch(guildId);
+      const member = await guild.members.fetch({ user: userId, force: true });
+      return { userId: member.id, roles: [...member.roles.cache.keys()], isBot: member.user.bot };
+    } catch (error) { if ([10007, 10013].includes(error.code)) return null; throw markDefinite(error); }
+  }
+  eventEmbed(event,{revealPrivate=false}={}) {
+    const entries = this.store.get('SELECT count(*) n FROM entries WHERE event_id=?', event.id).n;
+    const roles = value => JSON.parse(value).map(id => `<@&${id}>`).join(', ') || '없음';
+    const embed = new EmbedBuilder().setColor(0x5865f2).setTitle(event.title).setDescription(event.description)
+      .addFields(
+        { name: '주최자', value: `<@${event.owner_id}>`, inline: true },
+        { name: '당첨 인원 / 참여자', value: `${event.winner_count}명 / ${entries}명`, inline: true },
+        { name: '상태', value: statuses[event.status] || event.status, inline: true },
+        { name: '진행 시간 / 수령 시간', value: eventTimesText(event), inline: true },
+        { name: '참여 가능 역할 (하나 이상)', value: roles(event.allow_roles) },
+        { name: '참여 거절 역할', value: roles(event.deny_roles) },
+      ).setFooter({ text: `GiveON · 이벤트 ${event.id}` });
+    if (event.ends_at) embed.addFields({ name: '참여 마감', value: time(event.ends_at) });
+    const summary=deliverySummary(this.store,event.id);
+    embed.addFields({name:'전달 방식',value:summary.label},{name:'상품 번호 · 실물 / 디지털',value:`${summary.directSlots.join(', ')||'없음'} / ${summary.digitalSlots.join(', ')||'없음'}`});
+    for(const slot of this.store.all('SELECT slot FROM prizes WHERE event_id=? ORDER BY slot LIMIT 3',event.id)){const p=productInfo(this.store,this.vault,event,slot.slot,revealPrivate);embed.addFields({name:`${p.slot}번 상품`,value:productNameLabel(p,revealPrivate)});}
+    if (event.proof_required) embed.addFields({ name: '수령 전 인증 필요', value: event.proof_instructions },{name:'인증 제출 기한',value:'수령 버튼을 누른 후 5분 내 텍스트·이미지를 제출해주세요.'});
+    return embed;
+  }
+  eventComponents(event) {
+    const disabled = event.status !== 'RUNNING' && event.status !== 'STARTING';
+    return [row(button(`join:${event.id}`, '참여', ButtonStyle.Success).setDisabled(disabled), button(`leave:${event.id}`, '참여 취소', ButtonStyle.Secondary).setDisabled(disabled),button(`ui:event:${event.id}`,'상세 보기',ButtonStyle.Secondary))];
+  }
+  publicEvent(event,notificationRoles=[]) {
+    const roleText=value=>JSON.parse(value).map(id=>`<@&${id}>`).join(', ')||'없음';
+    const entries=this.store.get('SELECT count(*) n FROM entries WHERE event_id=?',event.id).n;
+    let body=`## ${event.title}\n${event.description}\n\n주최자 <@${event.owner_id}>\n당첨 인원 / 참여자: **${event.winner_count}명 / ${entries}명**\n상태: **${statuses[event.status]}**\n진행 시간 / 수령 시간: **${eventTimesText(event)}**\n참여 가능: ${roleText(event.allow_roles)}\n참여 차단: ${roleText(event.deny_roles)}`;
+    if(event.ends_at)body+=`\n참여 마감: ${time(event.ends_at)}`;
+    const summary=deliverySummary(this.store,event.id);body+=`\n전달 방식: **${summary.label}**`;
+    if(summary.directSlots.length)body+='\n실물 상품은 주최자와 개인 DM으로 연락해주세요. 주소는 봇에 제출하지 마세요.';
+    let shown=0;for(const slot of this.store.all('SELECT slot FROM prizes WHERE event_id=? ORDER BY slot LIMIT 5',event.id)){const p=productInfo(this.store,this.vault,event,slot.slot),line=`\n${p.slot}번 상품: **${p.name}**`;if(body.length+line.length>3540)break;body+=line;shown++;}
+    if(shown<event.winner_count)body+='\n전체 상품은 상세 보기 → 상품 목록에서 확인하세요.';
+    if(event.proof_required){const available=Math.max(0,3800-body.length);body+=`\n\n**수령 전 인증 필요**\n${event.proof_instructions.slice(0,available)}${event.proof_instructions.length>available?'…\n전체 인증 안내는 상세 보기에서 확인하세요.':''}`;}
+    body+=`\n-# 이벤트 ${event.id}`;
+    const container=new ContainerBuilder().setAccentColor(0x18e979).addTextDisplayComponents(new TextDisplayBuilder().setContent(body)).addActionRowComponents(...this.eventComponents(event));
+    return {flags:MessageFlags.IsComponentsV2,components:[...(notificationRoles.length?[new TextDisplayBuilder().setContent(notificationRoles.map(id=>`<@&${id}>`).join(' '))]:[]),container]};
+  }
+  async prepareDM(userId) {
+    try { return (await (await this.client.users.fetch(userId)).createDM()).id; }
+    catch (error) { throw markDefinite(error); }
+  }
+  applicationView(event) {
+    const decision=this.store.get("SELECT action,actor_id,created_at FROM audit WHERE event_id=? AND action IN ('APPROVED','REJECTED','CANCELLED') ORDER BY id DESC LIMIT 1",event.id);
+    const pending=event.status==='PENDING'||event.status==='DRAFT';
+    const label=pending?'⏳ 승인 대기':event.status==='REJECTED'?'❌ 거절 완료':event.status==='CANCELLED'?'⚪ 취소됨':'✅ 승인 완료';
+    const embed=new EmbedBuilder().setColor(pending?0xfee75c:event.status==='REJECTED'?0xed4245:event.status==='CANCELLED'?0x99aab5:0x57f287)
+      .setTitle(`이벤트 ${label}`).setDescription(`**${event.title}**\n${event.description}`)
+      .setFooter({text:`job:application:${event.id}`})
+      .addFields({name:'검토 상태',value:label},{name:'진행 상태',value:statuses[event.status]||event.status,inline:true},
+        {name:'이벤트 번호',value:event.id},{name:'주최자',value:`<@${event.owner_id}>`},
+        {name:'당첨 인원 / 인증',value:`${event.winner_count}명 / ${event.proof_required?'필요':'없음'}`,inline:true},
+        {name:'진행 시간 / 수령 시간',value:eventTimesText(event),inline:true},
+        {name:'상품 전달 방식',value:deliverySummary(this.store,event.id).label},
+        {name:'역할 조건',value:`허용: ${JSON.parse(event.allow_roles).map(id=>`<@&${id}>`).join(', ')||'제한 없음'}\n거절: ${JSON.parse(event.deny_roles).map(id=>`<@&${id}>`).join(', ')||'없음'}`});
+    if(event.proof_required)embed.addFields({name:'인증 안내',value:event.proof_instructions||'없음'});
+    if(decision)embed.addFields({name:'처리자',value:decision.actor_id?`<@${decision.actor_id}>`:'기록 없음',inline:true},{name:'처리 시각',value:`<t:${Math.floor(decision.created_at/1000)}:F>`,inline:true});
+    if(event.status==='REJECTED')embed.addFields({name:'거절 사유',value:event.rejection_reason||'사유 없음'});
+    const components=[button(`ui:manageevent:${event.id}`,'이벤트·상품 확인')];
+    if(pending)components.push(button(`eapprove:${event.id}`,'승인·시작',ButtonStyle.Success),button(`ereject:${event.id}`,'거절',ButtonStyle.Danger));
+    const channel=this.store.get("SELECT channel_id FROM jobs WHERE kind='start' AND ref_id=?",event.id)?.channel_id;
+    if(event.public_message_id&&channel)components.push(new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('이벤트 바로가기').setURL(`https://discord.com/channels/${event.guild_id}/${channel}/${event.public_message_id}`));
+    return {content:'',embeds:[embed],components:[row(...components)],allowedMentions:{parse:[],users:[],roles:[]}};
+  }
+  async updateApplication(event) {
+    const job=this.store.get("SELECT message_id,channel_id FROM jobs WHERE kind='application' AND ref_id=?",event.id);
+    if(!job?.message_id||!job.channel_id)return;
+    const channel=await this.client.channels.fetch(job.channel_id),message=await channel.messages.fetch(job.message_id);
+    if(message.author.id!==this.client.user.id)throw new Error('APPLICATION_MESSAGE_IDENTITY_MISMATCH');
+    await channel.messages.edit(job.message_id,this.applicationView(this.store.event(event.id)));
+  }
+  async retireEvent(job,event) {
+    const channel=await this.client.channels.fetch(job.channel_id),message=await channel.messages.fetch(job.message_id);
+    if(message.author.id!==this.client.user.id)throw new Error('EVENT_MESSAGE_IDENTITY_MISMATCH');
+    const current=this.store.event(event.id);
+    const url=`https://discord.com/channels/${event.guild_id}/${job.channel_id}/${current.public_message_id}`;
+    await channel.messages.edit(job.message_id,{flags:MessageFlags.IsComponentsV2,content:null,embeds:[],components:[new TextDisplayBuilder().setContent(`이 이벤트는 최신 메시지로 이동했어요.\n[${event.title} · 최신 이벤트 보기](${url})`)],allowedMentions:{parse:[]}});
+  }
+  async sendPrize(channelId, event, claim, content) {
+    let sending = false;
+    try {
+      const product=productInfo(this.store,this.vault,event,claim.slot,true);
+      const channel = await this.client.channels.fetch(channelId);
+      sending = true;
+      return await channel.send({
+        embeds: [new EmbedBuilder().setColor(0x57f287).setTitle(`${event.title} · ${claim.slot}번 ${product.name}`)
+          .setDescription(content.text || '첨부된 상품 이미지를 확인해주세요.')
+          .setFooter({ text: `giveaway-delivery:${claim.id}` })],
+        files: files(content, 'prize'),
+        components:product.direct?[row(profileButton(event.owner_id,'주최자 프로필 열기'))]:[],
+        allowedMentions: { parse: [] },
+        nonce: claim.delivery_nonce, enforceNonce: true,
+      });
+    } catch (error) { if (!sending) error.definite = true; throw markDefinite(error); }
+  }
+  async channelFor(job, event, claim) {
+    if(job.kind==='proof')return job.id.includes(':host:')&&job.channel_id?job.channel_id:this.prepareDM(event.owner_id);
+    if (job.channel_id) return job.channel_id;
+    if(job.kind==='bump')return this.store.get("SELECT channel_id FROM jobs WHERE kind='start' AND ref_id=?",event.id)?.channel_id;
+    if(HOST_NOTICE_KINDS.has(job.kind))return this.prepareDM(event.owner_id);
+    const settings = this.store.guild(event.guild_id);
+    if (['application', 'deliveryIssue', 'drawIssue'].includes(job.kind)) return settings.manager_channel;
+    if (['rejected'].includes(job.kind)) return this.prepareDM(event.owner_id);
+    if (['rework', 'denied'].includes(job.kind)) return this.prepareDM(claim.user_id);
+    if(['winner','closed'].includes(job.kind)&&event.public_message_id) {
+      const original=this.store.get("SELECT channel_id FROM jobs WHERE kind='start' AND ref_id=?",event.id);
+      if(original?.channel_id)return original.channel_id;
+    }
+    return settings.event_channel;
+  }
+  async sendNotification(job, event, claim) {
+    let sending = false;
+    try {
+      const channelId = await this.channelFor(job, event, claim);
+      const channel = await this.client.channels.fetch(channelId);
+      // 전송 전에 대상 채널을 기록해 설정 변경·재시작 후에도 동일한 메시지를 찾습니다.
+      this.store.run('UPDATE jobs SET channel_id=? WHERE id=?', channelId, job.id);
+      const marker = `job:${job.id}`;
+      const embed = new EmbedBuilder().setColor(0x5865f2).setFooter({ text: marker });
+      let components = [], content = '';
+      const users = [], roles = [];
+      switch (job.kind) {
+        case 'hostCreated':
+          embed.setTitle('이벤트 초안 생성').setDescription(`이벤트: ${event.title}\n이벤트 번호: ${event.id}\n내 신청에서 내용을 완성하고 승인 요청을 진행해주세요.\n진행 알림 설정: /gon alert on 또는 /gon alert off`);break;
+        case 'hostDraftExpired':
+          embed.setTitle('작성 중인 이벤트 초안 만료').setDescription(`이벤트: ${event.title}\n이벤트 번호: ${event.id}\n서버에서 정한 기간 동안 내용 수정이 없어 초안이 만료되었습니다. 등록한 상품 전달 원문은 삭제되었어요.\n새 이벤트는 신청 안내에서 만들 수 있어요.\n진행 알림 설정: /gon alert on 또는 /gon alert off`);break;
+        case 'hostCancelled': {
+          const action=this.store.get("SELECT action,actor_id FROM audit WHERE event_id=? AND action IN ('CANCELLED','DRAFT_REPLACED') ORDER BY id DESC LIMIT 1",event.id);
+          embed.setTitle('이벤트 취소').setDescription(`이벤트: ${event.title}\n이벤트 번호: ${event.id}\n취소자: ${action?.actor_id?`<@${action.actor_id}>`:'확인되지 않음'}${action?.action==='DRAFT_REPLACED'?'\n새 초안 작성으로 기존 초안이 취소되었습니다.':''}\n내 신청에서 상태를 확인할 수 있어요.\n진행 알림 설정: /gon alert on 또는 /gon alert off`);break;
+        }
+        case 'hostStarted':
+          embed.setTitle('이벤트 진행 승인·게시 완료').setDescription(`이벤트: ${event.title}\n이벤트 번호: ${event.id}\n참여 마감: ${time(event.ends_at)}\n진행 알림 설정: /gon alert on 또는 /gon alert off`);break;
+        case 'hostReceived': {
+          const direct=isDirect(this.store,event.id,claim.slot);
+          embed.setTitle(direct?'당첨자에게 연락 안내 완료':'당첨자 상품 수령 완료').setDescription(`이벤트: ${event.title}\n${claim.slot}번 상품: ${productInfo(this.store,this.vault,event,claim.slot,true).name}\n이벤트 번호: ${event.id}\n당첨자: <@${claim.user_id}>\n당첨 번호: ${claim.id}${direct?'\n아래 당첨자 프로필에서 개인 DM으로 연락해 실물 전달을 진행해주세요.\n이름·주소·연락처는 당첨자와 직접 주고받고 봇에 제출하지 마세요.\n이 안내는 배송·실물 수령 완료를 뜻하지 않습니다.':''}\n진행 알림 설정: /gon alert on 또는 /gon alert off`);
+          if(direct)components=[row(profileButton(claim.user_id,'당첨자 프로필 열기'))];
+          break;
+        }
+        case 'application':
+          sending=true;
+          return await channel.send({...this.applicationView(this.store.event(event.id)),nonce:nonce(job.id),enforceNonce:true});
+        case 'bump': {
+          const current=this.store.event(event.id);
+          if(current.status!=='RUNNING'||current.ends_at<=Date.now())throw Object.assign(new Error('EVENT_ENDED'),{definite:true,code:'EVENT_ENDED'});
+          const body=this.publicEvent(current);
+          body.components.push(new TextDisplayBuilder().setContent(`-# job:${job.id}`));
+          sending=true;
+          return await channel.send({...body,allowedMentions:{parse:[],users:[],roles:[]},nonce:nonce(job.id),enforceNonce:true});
+        }
+        case 'start':
+          content = JSON.parse(this.store.guild(event.guild_id).mention_roles).map(id => `<@&${id}>`).join(' ');
+          roles.push(...JSON.parse(this.store.guild(event.guild_id).mention_roles));
+          sending = true;
+          return await channel.send({ ...this.publicEvent(event,roles),allowedMentions: { parse: [], users, roles }, nonce: nonce(job.id), enforceNonce: true });
+        case 'winner':
+          content = `<@${claim.user_id}>`; users.push(claim.user_id);
+          embed.setTitle(`${event.title} 당첨`).setDescription(`축하합니다! 아래 버튼으로 수령해주세요.\n${claim.slot}번 상품: **${productInfo(this.store,this.vault,event,claim.slot).name}**\n당첨 번호: \`${claim.id}\`\n전달 방식: ${isDirect(this.store,event.id,claim.slot)?'실물·직접 전달 (주최자 연락 안내)':'디지털 자동 전달'}\n수령 기한: ${time(Date.now() + event.claim_ms)}${event.proof_required ? '\n수령 클릭 후 5분 내 인증 자료 제출이 필요해요.' : ''}`);
+          components = [row(button(`claim:${claim.id}`, '수령', ButtonStyle.Success))];
+          break;
+        case 'proof':
+          embed.setTitle('주최자 인증 검수 요청').setDescription(`이벤트: ${event.title}\n${claim.slot}번 상품: ${productInfo(this.store,this.vault,event,claim.slot,true).name}\n당첨 번호: \`${claim.id}\`\n당첨자: <@${claim.user_id}>\n제출 버전: ${claim.proof_version}\n아래 버튼으로 자료를 확인하고 승인·보완 요청·거절을 진행해주세요.\nDM을 사용할 수 없으면 서버 안내의 내 신청 → 내 이벤트 인증 대기에서도 확인할 수 있어요.`);
+          components = [row(button(`pview:${claim.id}`, '인증 자료 확인·검수'))];
+          break;
+        case 'rework': {
+          const feedback = claim.feedback ? this.vault.open(claim.feedback, `feedback:${claim.id}`).text : '자료를 보완해주세요.';
+          embed.setTitle('인증 보완 요청').setDescription(`${feedback}\n\n이벤트: ${event.title}\n${claim.slot}번 상품: ${productInfo(this.store,this.vault,event,claim.slot,true).name}\n당첨 번호: \`${claim.id}\`\n재제출 기한: ${time(claim.submit_deadline)}\n아래 보완 제출 버튼으로 이 DM에서 사진·메시지를 다시 제출할 수 있어요.`);
+          components=[row(button(`ui:proofupload:${claim.id}:${claim.proof_version}`,'보완 제출',ButtonStyle.Success),button(`proofstatus:${claim.id}`,'상태 확인',ButtonStyle.Secondary))];
+          break;
+        }
+        case 'denied': embed.setTitle('인증 거절').setDescription(`이벤트: ${event.title}\n당첨 번호: ${claim.id}\n해당 당첨 자리는 리롤됩니다.`); break;
+        case 'expired': embed.setTitle('당첨 자리 리롤').setDescription(`이벤트: ${event.title}\n당첨 번호: ${claim.id}\n기존 당첨이 종료되어 해당 자리의 후보를 다시 추첨합니다.`); break;
+        case 'received': embed.setTitle(isDirect(this.store,event.id,claim.slot)?'주최자 연락 안내 완료':'상품 수령 완료').setDescription(`이벤트: ${event.title}\n${claim.slot}번 상품: ${productInfo(this.store,this.vault,event,claim.slot).name}\n당첨자: <@${claim.user_id}>\n당첨 번호: ${claim.id}`); break;
+        case 'deliveryIssue': embed.setTitle('상품 전달 상태 확인 필요').setDescription(`이벤트: ${event.title}\n당첨 번호: ${claim.id}\n상태: ${statuses[claim.status]}\n실패 건은 내 당첨의 다시 시도 버튼, 결과 불명 건은 관리자 메뉴의 지급 결과 확인 버튼을 사용해주세요.`); break;
+        case 'drawIssue': embed.setTitle('추첨 지연').setDescription(`이벤트: ${event.title}\n이벤트 번호: ${event.id}\n참여자 역할 확인에 실패해 추첨을 보류했어요. 서버 접근 권한과 네트워크를 확인해주세요. 다음 주기에 재시도합니다.`); break;
+        case 'rejected': embed.setTitle('이벤트 신청 거절').setDescription(`이벤트: ${event.title}\n이벤트 번호: ${event.id}\n사유: ${event.rejection_reason}\n봇의 상품 원문은 삭제되었습니다.`); break;
+        case 'closed': {
+          const sent = this.store.get("SELECT count(*) n FROM prizes WHERE event_id=? AND status='DELIVERED'", event.id).n;
+          const directSent=this.store.get("SELECT count(*) n FROM prizes WHERE event_id=? AND status='DELIVERED' AND delivery_mode='DIRECT'",event.id).n;
+          embed.setTitle(event.status === 'CANCELLED' ? '이벤트 취소' : '이벤트 마감').setDescription(`이벤트: ${event.title}\n이벤트 번호: ${event.id}\n처리 완료: ${sent}/${event.winner_count}\n디지털 지급 완료: ${sent-directSent}건\n실물 연락 안내 완료: ${directSent}건\n${sent < event.winner_count ? '남은 미지급 상품 원문은 삭제되었습니다.' : directSent?'실물 전달은 주최자와 당첨자가 개인 DM으로 진행합니다.':'모든 상품이 지급되었습니다.'}`);
+          break;
+        }
+        default: throw Object.assign(new Error('알림 종류 오류'), { definite: true });
+      }
+      if(HOST_NOTICE_KINDS.has(job.kind)&&this.store.get('SELECT enabled FROM notification_prefs WHERE user_id=?',event.owner_id)?.enabled===0)throw Object.assign(new Error('NOTICE_DISABLED'),{code:'NOTICE_DISABLED',definite:true});
+      sending = true;
+      const reply=['winner','closed'].includes(job.kind)&&event.public_message_id?{messageReference:event.public_message_id,failIfNotExists:false}:undefined;
+      return await channel.send({ content, embeds: [embed], components, allowedMentions: { parse: [], users, roles, ...(reply?{repliedUser:false}:{}) }, ...(reply?{reply}:{}), nonce: nonce(job.id), enforceNonce: true });
+    } catch (error) { if (!sending) error.definite = true; throw markDefinite(error); }
+  }
+  async findMessage(channelId, marker, since = 0, deliveryNonce = null,componentId=null) {
+    if (!channelId) return null;
+    const channel = await this.client.channels.fetch(channelId);
+    let before;
+    for (let page = 0; page < 10; page++) {
+      const messages = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+      const found = messages.find(message => message.author.id === this.client.user.id &&
+        ((deliveryNonce && String(message.nonce) === deliveryNonce) || (componentId&&JSON.stringify((message.components||[]).map(c=>c.toJSON?c.toJSON():c)).includes(`"custom_id":"${componentId}"`)) || message.embeds.some(embed => embed.footer?.text === marker || embed.footer?.text?.endsWith(` · ${marker}`)) || (marker.startsWith('job:bump:')&&(message.components||[]).some(c=>(c.content||c.data?.content)===`-# ${marker}`))));
+      if (found) return found;
+      if (!messages.size || messages.size < 100 || messages.last().createdTimestamp < since - 60_000) return null;
+      before = messages.last().id;
+    }
+    return null;
+  }
+  findPrize(claim) { return this.findMessage(claim.dm_channel_id, `giveaway-delivery:${claim.id}`, claim.send_started, claim.delivery_nonce); }
+  async findNotification(job, event, claim) {
+    const channel=await this.channelFor(job,event,claim);
+    if(job.kind==='bump')return this.findMessage(channel,`job:${job.id}`,job.created_at,nonce(job.id));
+    if(job.kind==='proof')return this.findMessage(channel,`job:${job.id}`,job.created_at,null,`papprove:${claim.id}:${claim.proof_version}`);
+    if(job.kind==='rework')return this.findMessage(channel,`job:${job.id}`,job.created_at,null,`ui:proofupload:${claim.id}:${claim.proof_version}`);
+    if(job.kind==='start') {
+      const found=await this.findMessage(channel,`GiveON · 이벤트 ${event.id}`,job.created_at,null,`join:${event.id}`);
+      if(found) return found;
+    }
+    return this.findMessage(channel,`job:${job.id}`,job.created_at);
+  }
+  async updateEvent(event) {
+    const job = this.store.get("SELECT channel_id FROM jobs WHERE kind='start' AND ref_id=?", event.id);
+    if (!job?.channel_id) return;
+    const channel = await this.client.channels.fetch(job.channel_id);
+    const message=await channel.messages.fetch(event.public_message_id);
+    if(message.author.id!==this.client.user.id) throw new Error('EVENT_MESSAGE_IDENTITY_MISMATCH');
+    const notificationText=message.content||((message.components||[]).filter(c=>c.type===10).map(c=>c.content||c.data?.content||'').join(' '));
+    const roles=[...notificationText.matchAll(/<@&(\d+)>/g)].map(match=>match[1]);
+    await channel.messages.edit(event.public_message_id, { ...this.publicEvent(event,roles),content:null,embeds:[],allowedMentions:{parse:[]} });
+  }
+}
+
+export const buttons = { row, button };
